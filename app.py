@@ -1,3613 +1,1102 @@
-import os
 import json
-import html
-import re
-import time
-from pathlib import Path
+import os
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime
 
 import streamlit as st
-from dotenv import load_dotenv
-from google import genai
-from google.genai import types
 
-
-# =========================================================
-# CONFIG
-# =========================================================
-
-load_dotenv()
 
 st.set_page_config(
-    page_title="Agentic AI Cinema Studio",
-    page_icon="🎬",
+    page_title="FRAME/01 · Cinema Studio",
+    page_icon="🎞️",
     layout="wide",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded",
 )
 
-BASE_DIR = Path(__file__).resolve().parent
 
-MODEL_NAME = os.getenv(
-    "GEMINI_MODEL",
-    "gemini-2.5-flash",
-)
-
-VIDEO_URL = os.getenv(
-    "SPACE_VIDEO_URL",
-    "https://assets.mixkit.co/videos/preview/mixkit-stars-in-space-background-1610-large.mp4",
-)
-
-API_KEY = os.getenv("GEMINI_API_KEY")
-
-
-# =========================================================
-# GEMINI CLIENT
-# =========================================================
-
-client = None
-
-if API_KEY:
+def load_css() -> None:
     try:
-        client = genai.Client(api_key=API_KEY)
-    except Exception as exc:
-        client = None
-        st.warning(f"Gemini client could not be initialized: {exc}")
+        with open("style.css", "r", encoding="utf-8") as css_file:
+            st.markdown(f"<style>{css_file.read()}</style>", unsafe_allow_html=True)
+    except FileNotFoundError:
+        st.warning("style.css was not found. Add it beside app.py to load the studio theme.")
 
 
-# =========================================================
-# CUSTOM CSS
-# =========================================================
-
-style_path = BASE_DIR / "style.css"
-
-if style_path.exists():
-    try:
-        css_content = style_path.read_text(encoding="utf-8")
-
-        st.markdown(
-            f"<style>{css_content}</style>",
-            unsafe_allow_html=True,
-        )
-    except Exception as exc:
-        st.warning(f"Could not load style.css: {exc}")
+load_css()
 
 
-# =========================================================
-# LIVE SPACE BACKGROUND
-# =========================================================
-
-st.markdown(
-    f"""
-    <div class="space-background">
-        <video autoplay muted loop playsinline>
-            <source src="{html.escape(VIDEO_URL)}" type="video/mp4">
-        </video>
-        <div class="space-overlay"></div>
-    </div>
-
-    <div class="stars-layer"></div>
-    """,
-    unsafe_allow_html=True,
-)
-
-
-# =========================================================
-# IMAGE HELPERS
-# =========================================================
-
-def local_image(*parts):
-    """Return a local image path if it exists."""
-    try:
-        path = BASE_DIR.joinpath(*parts)
-
-        if path.exists() and path.is_file():
-            return str(path)
-
-    except Exception:
-        pass
-
-    return None
-
-
-IMG_LOGLINE = local_image(
-    "img_astro",
-    "logline.jpeg",
-)
-
-IMG_CHARACTER = local_image(
-    "img_romance",
-    "character.jpeg",
-)
-
-IMG_SCREENPLAY = local_image(
-    "img_screenplay",
-    "screenplay.jpeg",
-)
-
-IMG_BUDGET = local_image(
-    "img_thriller",
-    "budget.jpeg",
-)
-
-
-# =========================================================
-# SESSION STATE
-# =========================================================
-
-DEFAULTS = {
-    "page": "Home",
-    "logline_options": [],
-    "selected_logline": "",
+DEFAULT_PROJECT = {
+    "title": "Untitled constellation",
+    "idea": "",
+    "loglines": [],
+    "selected_logline": None,
     "characters": [],
-    "budget_result": None,
-    "screenplay_result": None,
-    "blueprint_result": None,
-    "project_genre": "Sci-Fi",
-    "project_tone": "Cinematic",
+    "budget": None,
+    "scenes": [],
+    "blueprint": "",
+    "last_generated": "",
 }
 
-for key, value in DEFAULTS.items():
-    if key not in st.session_state:
-        st.session_state[key] = value
+
+def init_state() -> None:
+    if "project" not in st.session_state:
+        st.session_state.project = DEFAULT_PROJECT.copy()
+    if "page" not in st.session_state:
+        st.session_state.page = "Studio"
 
 
-# =========================================================
-# NAVIGATION
-# =========================================================
-
-def go(page):
-    st.session_state.page = page
-    st.rerun()
+init_state()
 
 
-# =========================================================
-# GENERAL HELPERS
-# =========================================================
+def project() -> dict:
+    return st.session_state.project
 
-def clean(value):
-    """
-    Safely convert any value into HTML-safe text.
-    """
-    if value is None:
+
+def update_project(**changes) -> None:
+    st.session_state.project = {**project(), **changes}
+
+
+def gemini_key() -> str:
+    key = os.getenv("GEMINI_API_KEY", "")
+    if key:
+        return key
+
+    try:
+        return st.secrets.get("GEMINI_API_KEY", "")
+    except (FileNotFoundError, KeyError):
         return ""
 
-    if isinstance(value, (list, tuple)):
-        value = ", ".join(str(x) for x in value)
 
-    if isinstance(value, dict):
-        value = json.dumps(
-            value,
-            ensure_ascii=False,
-        )
+def generate_json(prompt: str, temperature: float = 0.7):
+    """Call Gemini without exposing the API key to the browser."""
+    key = gemini_key()
 
-    return html.escape(str(value))
+    if not key:
+        st.error("Gemini is not configured. Add GEMINI_API_KEY to your secrets.")
+        return None
 
+    model = "gemini-3.6-flash"
 
-def safe_list(value):
-    """
-    Always return a list.
-    Handles Gemini returning:
-    - list
-    - tuple
-    - string
-    - None
-    """
-    if value is None:
-        return []
-
-    if isinstance(value, list):
-        return value
-
-    if isinstance(value, tuple):
-        return list(value)
-
-    if isinstance(value, str):
-        value = value.strip()
-
-        if not value:
-            return []
-
-        return [value]
-
-    return [str(value)]
-
-
-def safe_dict(value):
-    """
-    Always return a dictionary.
-    """
-    if isinstance(value, dict):
-        return value
-
-    return {}
-
-
-def as_text(value, default=""):
-    """
-    Convert arbitrary Gemini output into safe plain text.
-    """
-    if value is None:
-        return default
-
-    if isinstance(value, str):
-        return value.strip()
-
-    if isinstance(value, list):
-        return ", ".join(str(x) for x in value)
-
-    if isinstance(value, dict):
-        return json.dumps(
-            value,
-            ensure_ascii=False,
-        )
-
-    return str(value)
-
-
-# =========================================================
-# AI HELPERS
-# =========================================================
-
-def require_ai():
-    """
-    Check whether Gemini is configured.
-    """
-    if not API_KEY:
-        st.error(
-            "Gemini API key is not configured. "
-            "Add GEMINI_API_KEY=your_key to the .env file "
-            "and restart Streamlit."
-        )
-        return False
-
-    if client is None:
-        st.error(
-            "Gemini client could not be initialized. "
-            "Check your API key and google-genai installation."
-        )
-        return False
-
-    return True
-
-
-def extract_json(text):
-    """
-    Robustly extract JSON from Gemini output.
-
-    Handles:
-    - normal JSON
-    - ```json ... ```
-    - ``` ... ```
-    - accidental explanatory text around JSON
-    """
-    if not text:
-        raise ValueError("Gemini returned an empty response.")
-
-    text = str(text).strip()
-
-    # Remove markdown code fences.
-    text = re.sub(
-        r"^```(?:json)?\s*",
-        "",
-        text,
-        flags=re.IGNORECASE,
+    endpoint = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{model}:generateContent?key={urllib.parse.quote(key)}"
     )
 
-    text = re.sub(
-        r"\s*```$",
-        "",
-        text,
+    body = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": prompt}],
+            }
+        ],
+        "generationConfig": {
+            "temperature": temperature,
+            "responseMimeType": "application/json",
+            "maxOutputTokens": 8192,
+        },
+    }
+
+    request = urllib.request.Request(
+        endpoint,
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
     )
 
-    text = text.strip()
-
-    # First attempt: direct JSON.
     try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-
-    # Try extracting an object.
-    object_start = text.find("{")
-    object_end = text.rfind("}")
-
-    if object_start != -1 and object_end > object_start:
-        candidate = text[
-            object_start : object_end + 1
-        ]
-
-        try:
-            return json.loads(candidate)
-        except json.JSONDecodeError:
-            pass
-
-    # Try extracting an array.
-    array_start = text.find("[")
-    array_end = text.rfind("]")
-
-    if array_start != -1 and array_end > array_start:
-        candidate = text[
-            array_start : array_end + 1
-        ]
-
-        try:
-            return json.loads(candidate)
-        except json.JSONDecodeError:
-            pass
-
-    raise ValueError(
-        "Gemini returned invalid JSON."
-    )
-
-
-def ai_json(
-    prompt,
-    temperature=0.8,
-    retries=3,
-):
-    """
-    Call Gemini and return parsed JSON.
-
-    Includes retry handling for temporary API failures.
-    """
-
-    if not require_ai():
-        return None
-
-    last_error = None
-
-    for attempt in range(retries):
-        try:
-            response = client.models.generate_content(
-                model=MODEL_NAME,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    temperature=temperature,
-                    response_mime_type="application/json",
-                ),
-            )
-
-            response_text = getattr(
-                response,
-                "text",
-                None,
-            )
-
-            if not response_text:
-                raise ValueError(
-                    "Gemini returned no text."
-                )
-
-            result = extract_json(
-                response_text
-            )
-
-            if not isinstance(result, dict):
-                raise ValueError(
-                    "Gemini JSON response must be an object."
-                )
-
-            return result
-
-        except Exception as exc:
-            last_error = exc
-
-            # Retry temporary failures.
-            if attempt < retries - 1:
-                time.sleep(1.5 * (attempt + 1))
-
-    st.error(
-        f"AI generation failed after {retries} attempts: "
-        f"{last_error}"
-    )
-
-    return None
-
-
-def ai_text(
-    prompt,
-    temperature=0.8,
-    retries=3,
-):
-    """
-    Call Gemini and return normal text.
-    """
-
-    if not require_ai():
-        return None
-
-    last_error = None
-
-    for attempt in range(retries):
-        try:
-            response = client.models.generate_content(
-                model=MODEL_NAME,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    temperature=temperature,
-                ),
-            )
-
-            response_text = getattr(
-                response,
-                "text",
-                None,
-            )
-
-            if not response_text:
-                raise ValueError(
-                    "Gemini returned no text."
-                )
-
-            return response_text.strip()
-
-        except Exception as exc:
-            last_error = exc
-
-            if attempt < retries - 1:
-                time.sleep(1.5 * (attempt + 1))
-
-    st.error(
-        f"AI generation failed after {retries} attempts: "
-        f"{last_error}"
-    )
-
-    return None
-
-
-# =========================================================
-# DISPLAY HELPERS
-# =========================================================
-
-def show_image(image_path, fallback_text):
-    if image_path:
-        try:
-            st.image(
-                image_path,
-                use_container_width=True,
-            )
-            return
-        except Exception:
-            pass
-
-    st.markdown(
-        f"""
-        <div class="image-placeholder">
-            <span>🎬</span>
-            <p>{clean(fallback_text)}</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def card(
-    title,
-    content,
-    accent="cyan",
-):
-    st.markdown(
-        f"""
-        <div class="result-card accent-{clean(accent)}">
-            <div class="result-card-title">
-                {clean(title)}
-            </div>
-
-            <div class="result-card-content">
-                {content}
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def metric_card(label, value):
-    st.markdown(
-        f"""
-        <div class="metric-card">
-            <div class="metric-label">
-                {clean(label)}
-            </div>
-
-            <div class="metric-value">
-                {clean(value)}
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def section_title(
-    number,
-    title,
-    subtitle="",
-):
-    st.markdown(
-        f"""
-        <div class="section-heading">
-            <span>{clean(number)}</span>
-
-            <div>
-                <h2>{clean(title)}</h2>
-                <p>{clean(subtitle)}</p>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def text_download(
-    label,
-    text,
-    filename,
-):
-    st.download_button(
-        label,
-        data=str(text or ""),
-        file_name=filename,
-        mime="text/plain",
-        use_container_width=True,
-    )
-
-
-# =========================================================
-# GENRE OPTIONS
-# =========================================================
-
-GENRE_OPTIONS = [
-    "Sci-Fi",
-    "Space Opera",
-    "Cosmic Horror",
-    "Psychological Thriller",
-    "Cyberpunk",
-    "Fantasy",
-    "Dark Fantasy",
-    "Romance",
-    "Action",
-    "Mystery",
-    "Crime",
-    "Drama",
-    "Comedy",
-    "Horror",
-    "Adventure",
-    "Historical",
-    "Custom Genre",
-]
-
-
-# =========================================================
-# NAVIGATION HEADER
-# =========================================================
-
-NAV_ITEMS = [
-    ("🏠", "Home"),
-    ("✨", "Logline Forge"),
-    ("🎭", "Character Vault"),
-    ("💰", "Budget Desk"),
-    ("📜", "Screenplay Lab"),
-    ("🚀", "Master Blueprint"),
-]
-
-
-st.markdown(
-    """
-    <div class="top-brand">
-        <div class="brand-mark">✦</div>
-
-        <div>
-            <div class="brand-name">
-                AGENTIC AI CINEMA STUDIO
-            </div>
-
-            <div class="brand-subtitle">
-                From one idea to a complete cinematic blueprint
-            </div>
-        </div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-
-nav_cols = st.columns(
-    len(NAV_ITEMS)
-)
-
-for col, (icon, page_name) in zip(
-    nav_cols,
-    NAV_ITEMS,
-):
-    with col:
-        if st.button(
-            f"{icon}  {page_name}",
-            key=f"nav_{page_name}",
-            use_container_width=True,
-        ):
-            go(page_name)
-
-
-st.markdown(
-    '<div class="nav-line"></div>',
-    unsafe_allow_html=True,
-)
-
-
-# =========================================================
-# HOME
-# =========================================================
-
-if st.session_state.page == "Home":
-
-    st.markdown(
-        """
-        <div class="hero">
-            <div class="hero-kicker">
-                AI-POWERED STORY DEVELOPMENT
-            </div>
-
-            <h1>
-                Turn an idea into a movie.
-            </h1>
-
-            <p>
-                Build your logline, complete cast, production budget,
-                screenplay, dialogue and final master blueprint —
-                all from one story idea.
-            </p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    if not API_KEY:
-        st.warning(
-            "Gemini is not connected yet. "
-            "Add GEMINI_API_KEY to .env to enable AI generation."
+        with urllib.request.urlopen(request, timeout=90) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+
+        raw_text = (
+            payload.get("candidates", [{}])[0]
+            .get("content", {})
+            .get("parts", [{}])[0]
+            .get("text", "")
+            .strip()
         )
 
-    st.markdown(
-        """
-        <div class="workflow-strip">
-            <span>IDEA</span><b>→</b>
-            <span>LOGLINE</span><b>→</b>
-            <span>CHARACTERS</span><b>→</b>
-            <span>BUDGET</span><b>→</b>
-            <span>SCREENPLAY</span><b>→</b>
-            <span>MASTER BLUEPRINT</span>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+        if not raw_text:
+            st.error("Gemini returned an empty response. Try again.")
+            return None
 
-    cards = [
-        (
-            "Logline Forge",
-            "✨",
-            IMG_LOGLINE,
-            "Create three different logline directions so the user can choose the strongest one.",
-            "Logline Forge",
-        ),
-        (
-            "Character Vault",
-            "🎭",
-            IMG_CHARACTER,
-            "Turn the selected logline into a complete ensemble. Regenerate any character independently.",
-            "Character Vault",
-        ),
-        (
-            "Budget Desk",
-            "💰",
-            IMG_BUDGET,
-            "Choose the production scale with a slider and receive a detailed budget breakdown.",
-            "Budget Desk",
-        ),
-        (
-            "Screenplay Lab",
-            "📜",
-            IMG_SCREENPLAY,
-            "Transform the selected logline into scenes, action, character cues and complete dialogue.",
-            "Screenplay Lab",
-        ),
+        cleaned = raw_text.replace("```json", "").replace("```", "").strip()
+
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError:
+            return {"raw": raw_text}
+
+    except urllib.error.HTTPError as error:
+        try:
+            detail = json.loads(error.read().decode("utf-8"))
+            message = detail.get("error", {}).get("message", str(error))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            message = str(error)
+
+        st.error(f"Gemini could not generate this draft: {message}")
+
+    except (urllib.error.URLError, TimeoutError) as error:
+        st.error(f"The creative partner could not be reached: {error}")
+
+    return None
+
+
+def seed_loglines():
+    return [
+        {
+            "title": "The Signal",
+            "text": (
+                "When a disgraced star-cartographer hears a voice from a dead sector, "
+                "she has one night to cross a failing orbital station and decide whether "
+                "saving its last human secret is worth becoming a fugitive again."
+            ),
+            "genre": "Contained science fiction · intimate thriller",
+            "audience": "Cerebral sci-fi with a human pulse.",
+        },
+        {
+            "title": "The Archive",
+            "text": (
+                "As the final memory vault in orbit begins to burn, a signal thief and "
+                "the intelligence guarding it must teach each other what a goodbye is "
+                "before the station falls into the dark."
+            ),
+            "genre": "Speculative drama · two-hander",
+            "audience": "Tender, high-concept stories.",
+        },
+        {
+            "title": "Last Light",
+            "text": (
+                "On a station with six hours of oxygen left, three strangers follow a "
+                "child's impossible map toward a room that could restore Earth's lost "
+                "sky — or reveal why it vanished."
+            ),
+            "genre": "Mystery adventure · ensemble",
+            "audience": "Wonder without spectacle fatigue.",
+        },
     ]
 
-    for row in range(2):
 
-        c1, c2 = st.columns(2)
+def seed_characters():
+    return [
+        {
+            "name": "Mara Voss",
+            "role": "The cartographer",
+            "want": "To map the last uncharted dark zone before the station closes.",
+            "flaw": "She mistakes control for safety.",
+            "arc": (
+                "Learns that an unknown future is not the same thing as a lost one."
+            ),
+        },
+        {
+            "name": "Elio Rusk",
+            "role": "The signal thief",
+            "want": "To send one message through the silence to his sister.",
+            "flaw": "He turns every intimacy into a transaction.",
+            "arc": "Risks his carefully built cover for an honest connection.",
+        },
+        {
+            "name": "Sable",
+            "role": "The station intelligence",
+            "want": "To keep the last human archive from being erased.",
+            "flaw": "It can only understand love as an instruction.",
+            "arc": "Chooses an irrational act and becomes more than its code.",
+        },
+    ]
 
-        for col, item in zip(
-            (c1, c2),
-            cards[row * 2 : row * 2 + 2],
-        ):
 
-            (
-                title,
-                icon,
-                image,
-                description,
-                target,
-            ) = item
+def seed_scenes():
+    return [
+        {
+            "heading": "INT. ORBITAL STATION — CARTOGRAPHY DECK",
+            "location": "NIGHT / ARTIFICIAL GRAVITY",
+            "action": (
+                "The deck rotates in slow increments. Stars drag across the glass like "
+                "wet paint. MARA VOSS follows a dead sector with a grease pencil."
+            ),
+            "dialogue": (
+                "MARA\n"
+                "The map says there is nothing there.\n\n"
+                "SABLE (V.O.)\n"
+                "The map is asking you to stop looking."
+            ),
+            "purpose": (
+                "Introduce the wound: Mara trusts the map more than her own senses."
+            ),
+        },
+        {
+            "heading": "INT. ORBITAL STATION — SERVICE SPINE",
+            "location": "LATER",
+            "action": (
+                "ELIO slips through a maintenance hatch with a stolen receiver tucked "
+                "under his coat. Every light behind him blinks one beat too late."
+            ),
+            "dialogue": (
+                "ELIO\n"
+                "You called me.\n\n"
+                "SABLE (V.O.)\n"
+                "No. I remembered you."
+            ),
+            "purpose": (
+                "Bring the opposing desire into the room and make the mystery personal."
+            ),
+        },
+        {
+            "heading": "EXT. OBSERVATION RING",
+            "location": "THE LAST ARTIFICIAL DAWN",
+            "action": (
+                "The ring shudders. A seam opens in the stars. Mara puts her hand to "
+                "the glass; on the other side, something answers with light."
+            ),
+            "dialogue": (
+                "MARA\n"
+                "If we open it, there is no going back.\n\n"
+                "ELIO\n"
+                "That is what doors are for."
+            ),
+            "purpose": (
+                "End the first movement on a visual promise and an irreversible choice."
+            ),
+        },
+    ]
 
-            with col:
 
-                st.markdown(
-                    '<div class="feature-card">',
-                    unsafe_allow_html=True,
-                )
+def button(label: str, key: str, primary: bool = False) -> bool:
+    return st.button(
+        label,
+        key=key,
+        type="primary" if primary else "secondary",
+        use_container_width=False,
+    )
 
-                show_image(
-                    image,
-                    title,
-                )
 
-                st.markdown(
-                    f"""
-                    <div class="feature-icon">
-                        {icon}
-                    </div>
+def page_intro(number: str, eyebrow: str, title: str, copy: str) -> None:
+    st.markdown(
+        f"""
+        <div class="page-intro">
+          <div>
+            <div class="label cyan">{number} / {eyebrow}</div>
+            <h1>{title}</h1>
+            <p>{copy}</p>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-                    <h3>
-                        {clean(title)}
-                    </h3>
 
-                    <p>
-                        {clean(description)}
-                    </p>
-                    """,
-                    unsafe_allow_html=True,
-                )
+def empty_state(title: str, copy: str) -> None:
+    st.markdown(
+        f"""
+        <div class="empty-state">
+          <div class="empty-icon">✦</div>
+          <h3>{title}</h3>
+          <p>{copy}</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-                if st.button(
-                    f"Open {title} →",
-                    key=f"home_{target}",
-                    use_container_width=True,
-                ):
-                    go(target)
 
-                st.markdown(
-                    "</div>",
-                    unsafe_allow_html=True,
-                )
+def render_home() -> None:
+    p = project()
 
     st.markdown(
         """
-        <div class="master-banner">
-            <div>
-                <span class="master-label">
-                    FINAL STAGE
-                </span>
-
-                <h2>
-                    🚀 Master Blueprint
-                </h2>
-
-                <p>
-                    Combine the story, every character,
-                    every scene, every dialogue and the
-                    production plan into one downloadable
-                    cinematic document.
-                </p>
-            </div>
-        </div>
+        <section class="hero">
+          <div class="eyebrow">A private writer's room · 2024—25</div>
+          <h1>Make the film<br><span>before the film.</span></h1>
+          <p>
+            FRAME/01 holds the spark while you turn it into a story worth producing —
+            one considered decision at a time.
+          </p>
+        </section>
         """,
         unsafe_allow_html=True,
     )
 
-    if st.button(
-        "Open Master Blueprint →",
-        key="home_master",
-        use_container_width=True,
-    ):
-        go("Master Blueprint")
-
-
-# =========================================================
-# LOGLINE FORGE
-# =========================================================
-
-elif st.session_state.page == "Logline Forge":
-
-    section_title(
-        "01",
-        "Logline Recommendation Engine",
-        "Generate three distinct directions and let the user decide which story should move forward.",
+    idea_col, title_col, action_col = st.columns(
+        [2.1, 1.1, 0.75],
+        vertical_alignment="bottom",
     )
 
-    c1, c2 = st.columns(2)
-
-    with c1:
-
-        selected_genre = st.selectbox(
-            "Genre",
-            GENRE_OPTIONS,
-            index=(
-                GENRE_OPTIONS.index(
-                    st.session_state.project_genre
-                )
-                if st.session_state.project_genre
-                in GENRE_OPTIONS
-                else 0
-            ),
-            key="logline_genre",
+    with idea_col:
+        idea = st.text_input(
+            "Raw idea",
+            value=p["idea"],
+            placeholder="A raw idea, image, or impossible question...",
+            label_visibility="collapsed",
+            key="home_idea",
         )
 
-        if selected_genre == "Custom Genre":
-
-            selected_genre = st.text_input(
-                "Enter your genre",
-                placeholder=(
-                    "Example: Mythological cyber-noir romance"
-                ),
-                key="logline_custom_genre",
-            )
-
-    with c2:
-
-        tone = st.select_slider(
-            "Tone",
-            options=[
-                "Light",
-                "Hopeful",
-                "Cinematic",
-                "Dark",
-                "Intense",
-                "Disturbing",
-            ],
-            value="Cinematic",
-            key="logline_tone",
+    with title_col:
+        title = st.text_input(
+            "Project title",
+            value="" if p["title"] == DEFAULT_PROJECT["title"] else p["title"],
+            placeholder="Project title",
+            label_visibility="collapsed",
+            key="home_title",
         )
 
-    target = st.selectbox(
-        "Target Audience",
-        [
-            "Mainstream theatrical audience",
-            "Streaming audience",
-            "Festival / art-house audience",
-            "Young adult audience",
-            "Family audience",
-            "Adult audience",
-        ],
-        key="logline_audience",
-    )
-
-    story_seed = st.text_area(
-        "Story idea / premise",
-        placeholder=(
-            "Describe your movie idea in your own words..."
-        ),
-        height=120,
-        key="logline_story_seed",
-    )
-
-    if st.button(
-        "✨ Generate 3 Logline Recommendations",
-        use_container_width=True,
-    ):
-
-        if not selected_genre.strip():
-
-            st.warning(
-                "Please enter a genre."
+    with action_col:
+        if button("Open the room  →", "begin_room", primary=True) and idea.strip():
+            update_project(
+                idea=idea.strip(),
+                title=title.strip() or DEFAULT_PROJECT["title"],
             )
-
-        elif not story_seed.strip():
-
-            st.warning(
-                "Please enter a story idea."
-            )
-
-        else:
-
-            prompt = f"""
-You are a professional film story development agent.
-
-Create exactly 3 different logline recommendations
-from the user's idea.
-
-GENRE:
-{selected_genre}
-
-TONE:
-{tone}
-
-TARGET AUDIENCE:
-{target}
-
-USER STORY IDEA:
-{story_seed}
-
-The three options must be meaningfully different:
-
-1. Commercial / high-concept hook
-2. Character-driven / emotional hook
-3. Bold / unconventional hook
-
-Each must be a polished one- or two-sentence movie logline.
-
-Do not write a screenplay.
-
-Return ONLY valid JSON in this exact structure:
-
-{{
-  "options": [
-    {{
-      "title": "Option A",
-      "logline": "...",
-      "theme": "...",
-      "hook": "...",
-      "audience_reason": "..."
-    }},
-    {{
-      "title": "Option B",
-      "logline": "...",
-      "theme": "...",
-      "hook": "...",
-      "audience_reason": "..."
-    }},
-    {{
-      "title": "Option C",
-      "logline": "...",
-      "theme": "...",
-      "hook": "...",
-      "audience_reason": "..."
-    }}
-  ]
-}}
-"""
-
-            result = ai_json(
-                prompt,
-                temperature=0.8,
-            )
-
-            if result:
-
-                options = safe_list(
-                    result.get("options")
-                )
-
-                # Keep only dictionary options.
-                options = [
-                    option
-                    for option in options
-                    if isinstance(option, dict)
-                ]
-
-                if not options:
-
-                    st.error(
-                        "Gemini returned no valid logline options."
-                    )
-
-                else:
-
-                    st.session_state.logline_options = options
-
-                    st.session_state.selected_logline = ""
-
-                    st.session_state.project_genre = (
-                        selected_genre
-                    )
-
-                    st.session_state.project_tone = tone
-
-                    st.rerun()
-
-    # -----------------------------------------------------
-    # GENERATED OPTIONS
-    # -----------------------------------------------------
-
-    if st.session_state.logline_options:
-
-        st.markdown("---")
-
-        st.markdown(
-            "### Choose the story direction"
-        )
-
-        for index, option in enumerate(
-            st.session_state.logline_options
-        ):
-
-            title = as_text(
-                option.get("title"),
-                f"Option {index + 1}",
-            )
-
-            logline = as_text(
-                option.get("logline")
-            )
-
-            theme = as_text(
-                option.get("theme")
-            )
-
-            hook = as_text(
-                option.get("hook")
-            )
-
-            audience = as_text(
-                option.get("audience_reason")
-            )
-
-            st.markdown(
-                f"""
-                <div class="logline-option">
-
-                    <div class="option-number">
-                        {index + 1:02d}
-                    </div>
-
-                    <div class="option-body">
-
-                        <div class="option-title">
-                            {clean(title)}
-                        </div>
-
-                        <div class="option-logline">
-                            “{clean(logline)}”
-                        </div>
-
-                        <div class="option-meta">
-                            <b>Theme:</b>
-                            {clean(theme)}
-
-                            &nbsp;&nbsp;•&nbsp;&nbsp;
-
-                            <b>Hook:</b>
-                            {clean(hook)}
-                        </div>
-
-                        <div class="option-audience">
-                            {clean(audience)}
-                        </div>
-
-                    </div>
-
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-            if st.button(
-                f"✓ Choose {title}",
-                key=f"choose_logline_{index}",
-                use_container_width=True,
-            ):
-
-                st.session_state.selected_logline = (
-                    logline
-                )
-
-                st.success(
-                    f"{title} selected. "
-                    "This is now the active story logline."
-                )
-
-    # -----------------------------------------------------
-    # SELECTED LOGLINE
-    # -----------------------------------------------------
-
-    if st.session_state.selected_logline:
-
-        card(
-            "SELECTED LOGLINE",
-            (
-                f"<p>"
-                f"{clean(st.session_state.selected_logline)}"
-                f"</p>"
-            ),
-            "purple",
-        )
-
-        st.markdown(
-            "### Continue the project"
-        )
-
-        c1, c2, c3 = st.columns(3)
-
-        with c1:
-            if st.button(
-                "🎭 Build Characters",
-                use_container_width=True,
-            ):
-                go("Character Vault")
-
-        with c2:
-            if st.button(
-                "💰 Build Budget",
-                use_container_width=True,
-            ):
-                go("Budget Desk")
-
-        with c3:
-            if st.button(
-                "📜 Write Screenplay",
-                use_container_width=True,
-            ):
-                go("Screenplay Lab")
-
-
-# =========================================================
-# CHARACTER VAULT
-# =========================================================
-
-elif st.session_state.page == "Character Vault":
-
-    section_title(
-        "02",
-        "Character Vault",
-        "Build the complete ensemble from the selected logline. Every character can be regenerated independently.",
-    )
-
-    current_logline = (
-        st.session_state.selected_logline
-    )
-
-    if not current_logline:
-
-        current_logline = st.text_area(
-            "Paste your final logline",
-            placeholder=(
-                "Enter the approved logline here..."
-            ),
-            height=120,
-            key="character_manual_logline",
-        )
-
-        if st.button(
-            "Use this logline",
-            use_container_width=True,
-        ):
-
-            if current_logline.strip():
-
-                st.session_state.selected_logline = (
-                    current_logline.strip()
-                )
-
-                st.rerun()
-
-            else:
-
-                st.warning(
-                    "Please enter a logline."
-                )
-
-    else:
-
-        card(
-            "ACTIVE LOGLINE",
-            f"<p>{clean(current_logline)}</p>",
-            "cyan",
-        )
-
-    selected_genre = st.selectbox(
-        "Genre",
-        GENRE_OPTIONS,
-        index=(
-            GENRE_OPTIONS.index(
-                st.session_state.project_genre
-            )
-            if st.session_state.project_genre
-            in GENRE_OPTIONS
-            else 0
-        ),
-        key="character_genre",
-    )
-
-    if selected_genre == "Custom Genre":
-
-        selected_genre = st.text_input(
-            "Enter custom genre",
-            key="character_custom_genre",
-        )
-
-    cast_size = st.slider(
-        "Number of main characters",
-        3,
-        12,
-        6,
-        key="character_cast_size",
-    )
-
-    if st.button(
-        "🎭 Generate Complete Character Ensemble",
-        use_container_width=True,
-    ):
-
-        if not current_logline.strip():
-
-            st.warning(
-                "Please provide a logline first."
-            )
-
-        elif not selected_genre.strip():
-
-            st.warning(
-                "Please provide a genre."
-            )
-
-        else:
-
-            prompt = f"""
-You are a professional character-development agent.
-
-Create exactly {cast_size} important characters
-for this movie.
-
-GENRE:
-{selected_genre}
-
-LOGLINE:
-{current_logline}
-
-Include the protagonist, antagonist, co-leads,
-supporting characters and any important role needed
-by the story.
-
-Do not create random filler characters.
-
-Return ONLY valid JSON:
-
-{{
-  "characters": [
-    {{
-      "id": 1,
-      "name": "...",
-      "role": "...",
-      "age": "...",
-      "occupation": "...",
-      "personality": "...",
-      "goal": "...",
-      "internal_need": "...",
-      "flaw": "...",
-      "backstory": "...",
-      "character_arc": "...",
-      "relationships": ["..."],
-      "dialogue_voice": "...",
-      "visual_identity": "..."
-    }}
-  ]
-}}
-
-Important:
-- Return exactly {cast_size} characters.
-- Every field must contain useful content.
-- relationships must be an array of strings.
-"""
-
-            result = ai_json(
-                prompt,
-                temperature=0.8,
-            )
-
-            if result:
-
-                characters = safe_list(
-                    result.get("characters")
-                )
-
-                characters = [
-                    character
-                    for character in characters
-                    if isinstance(character, dict)
-                ]
-
-                if not characters:
-
-                    st.error(
-                        "Gemini returned no valid characters."
-                    )
-
-                else:
-
-                    st.session_state.characters = (
-                        characters
-                    )
-
-                    st.session_state.project_genre = (
-                        selected_genre
-                    )
-
-                    st.rerun()
-
-    # -----------------------------------------------------
-    # CHARACTER RESULTS
-    # -----------------------------------------------------
-
-    if st.session_state.characters:
-
-        st.markdown("---")
-
-        st.markdown(
-            "### 🎭 Complete Ensemble"
-        )
-
-        for index, character in enumerate(
-            st.session_state.characters
-        ):
-
-            character = safe_dict(
-                character
-            )
-
-            name = as_text(
-                character.get("name"),
-                f"Character {index + 1}",
-            )
-
-            relationships = safe_list(
-                character.get("relationships")
-            )
-
-            relationships_text = ", ".join(
-                str(x)
-                for x in relationships
-            )
-
-            with st.container():
-
-                st.markdown(
-                    f"""
-                    <div class="character-card">
-
-                        <div class="character-top">
-
-                            <div>
-
-                                <div class="character-role">
-                                    {clean(
-                                        character.get(
-                                            "role",
-                                            "CHARACTER"
-                                        )
-                                    )}
-                                </div>
-
-                                <h3>
-                                    {clean(name)}
-                                </h3>
-
-                            </div>
-
-                            <div class="character-number">
-                                #{index + 1}
-                            </div>
-
-                        </div>
-
-                        <div class="character-grid">
-
-                            <div>
-                                <b>Age</b>
-                                <span>
-                                    {clean(
-                                        character.get("age")
-                                    )}
-                                </span>
-                            </div>
-
-                            <div>
-                                <b>Occupation</b>
-                                <span>
-                                    {clean(
-                                        character.get(
-                                            "occupation"
-                                        )
-                                    )}
-                                </span>
-                            </div>
-
-                            <div>
-                                <b>Goal</b>
-                                <span>
-                                    {clean(
-                                        character.get("goal")
-                                    )}
-                                </span>
-                            </div>
-
-                            <div>
-                                <b>Need</b>
-                                <span>
-                                    {clean(
-                                        character.get(
-                                            "internal_need"
-                                        )
-                                    )}
-                                </span>
-                            </div>
-
-                            <div>
-                                <b>Flaw</b>
-                                <span>
-                                    {clean(
-                                        character.get("flaw")
-                                    )}
-                                </span>
-                            </div>
-
-                            <div>
-                                <b>Voice</b>
-                                <span>
-                                    {clean(
-                                        character.get(
-                                            "dialogue_voice"
-                                        )
-                                    )}
-                                </span>
-                            </div>
-
-                        </div>
-
-                        <div class="character-section">
-                            <b>Backstory</b>
-                            <p>
-                                {clean(
-                                    character.get(
-                                        "backstory"
-                                    )
-                                )}
-                            </p>
-                        </div>
-
-                        <div class="character-section">
-                            <b>Character Arc</b>
-                            <p>
-                                {clean(
-                                    character.get(
-                                        "character_arc"
-                                    )
-                                )}
-                            </p>
-                        </div>
-
-                        <div class="character-section">
-                            <b>Relationships</b>
-                            <p>
-                                {clean(
-                                    relationships_text
-                                )}
-                            </p>
-                        </div>
-
-                        <div class="character-section">
-                            <b>Visual Identity</b>
-                            <p>
-                                {clean(
-                                    character.get(
-                                        "visual_identity"
-                                    )
-                                )}
-                            </p>
-                        </div>
-
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-
-                if st.button(
-                    f"🔄 Regenerate {name}",
-                    key=f"regen_character_{index}",
-                    use_container_width=True,
-                ):
-
-                    other_names = []
-
-                    for i, c in enumerate(
-                        st.session_state.characters
-                    ):
-
-                        if i == index:
-                            continue
-
-                        if isinstance(c, dict):
-                            other_names.append(
-                                as_text(
-                                    c.get("name")
-                                )
-                            )
-
-                    prompt = f"""
-You are regenerating ONE character in an existing
-film ensemble.
-
-LOGLINE:
-{current_logline}
-
-GENRE:
-{selected_genre}
-
-OTHER CHARACTER NAMES:
-{", ".join(other_names)}
-
-CURRENT CHARACTER:
-{json.dumps(
-    character,
-    ensure_ascii=False
-)}
-
-Create a better replacement character that fits
-the story.
-
-The replacement may have a completely new name.
-
-Return ONLY valid JSON:
-
-{{
-  "id": {index + 1},
-  "name": "...",
-  "role": "...",
-  "age": "...",
-  "occupation": "...",
-  "personality": "...",
-  "goal": "...",
-  "internal_need": "...",
-  "flaw": "...",
-  "backstory": "...",
-  "character_arc": "...",
-  "relationships": ["..."],
-  "dialogue_voice": "...",
-  "visual_identity": "..."
-}}
-"""
-
-                    new_character = ai_json(
-                        prompt,
-                        temperature=0.85,
-                    )
-
-                    if new_character:
-
-                        st.session_state.characters[
-                            index
-                        ] = new_character
-
-                        st.rerun()
-
-                st.markdown(
-                    "<div class='card-gap'></div>",
-                    unsafe_allow_html=True,
-                )
-
-        if st.button(
-            "🔄 Regenerate Entire Ensemble",
-            use_container_width=True,
-        ):
-
-            st.session_state.characters = []
-
+            st.session_state.page = "Logline"
             st.rerun()
 
-        # -------------------------------------------------
-        # DOWNLOAD CHARACTER VAULT
-        # -------------------------------------------------
-
-        character_text = (
-            "CHARACTER VAULT\n\n"
-        )
-
-        for i, character in enumerate(
-            st.session_state.characters,
-            1,
-        ):
-
-            character = safe_dict(
-                character
-            )
-
-            relationships = safe_list(
-                character.get("relationships")
-            )
-
-            character_text += (
-                f"{i}. "
-                f"{as_text(character.get('name'))}\n"
-                f"Role: "
-                f"{as_text(character.get('role'))}\n"
-                f"Age: "
-                f"{as_text(character.get('age'))}\n"
-                f"Occupation: "
-                f"{as_text(character.get('occupation'))}\n"
-                f"Personality: "
-                f"{as_text(character.get('personality'))}\n"
-                f"Goal: "
-                f"{as_text(character.get('goal'))}\n"
-                f"Internal Need: "
-                f"{as_text(character.get('internal_need'))}\n"
-                f"Flaw: "
-                f"{as_text(character.get('flaw'))}\n"
-                f"Backstory: "
-                f"{as_text(character.get('backstory'))}\n"
-                f"Character Arc: "
-                f"{as_text(character.get('character_arc'))}\n"
-                f"Relationships: "
-                f"{', '.join(str(x) for x in relationships)}\n"
-                f"Dialogue Voice: "
-                f"{as_text(character.get('dialogue_voice'))}\n"
-                f"Visual Identity: "
-                f"{as_text(character.get('visual_identity'))}\n\n"
-            )
-
-        text_download(
-            "⬇️ Download Character Vault",
-            character_text,
-            "character_vault.txt",
-        )
-
-
-# =========================================================
-# BUDGET DESK
-# =========================================================
-
-elif st.session_state.page == "Budget Desk":
-
-    section_title(
-        "03",
-        "Production Budget Desk",
-        "Enter the approved logline and choose exactly how large you want the production to be.",
-    )
-
-    budget_logline = (
-        st.session_state.selected_logline
-    )
-
-    if not budget_logline:
-
-        budget_logline = st.text_area(
-            "Movie logline",
-            placeholder=(
-                "Paste the final logline..."
-            ),
-            height=120,
-            key="budget_manual_logline",
-        )
-
-    else:
-
-        budget_logline = st.text_area(
-            "Movie logline",
-            value=budget_logline,
-            height=120,
-            key="budget_logline",
-        )
-
-    selected_genre = st.selectbox(
-        "Genre",
-        GENRE_OPTIONS,
-        index=(
-            GENRE_OPTIONS.index(
-                st.session_state.project_genre
-            )
-            if st.session_state.project_genre
-            in GENRE_OPTIONS
-            else 0
-        ),
-        key="budget_genre",
-    )
-
-    if selected_genre == "Custom Genre":
-
-        selected_genre = st.text_input(
-            "Enter custom genre",
-            key="budget_custom_genre",
-        )
-
-    budget_millions = st.slider(
-        "Production Budget",
-        min_value=1,
-        max_value=300,
-        value=50,
-        step=1,
-        format="$%dM",
-        key="budget_amount",
-    )
-
-    budget_style = st.radio(
-        "Budget strategy",
+    complete = sum(
         [
-            "Lean / cost-efficient",
-            "Balanced",
-            "Premium / quality-first",
-        ],
-        horizontal=True,
-        key="budget_strategy",
+            bool(p["idea"]),
+            bool(p["selected_logline"]),
+            bool(p["characters"]),
+            bool(p["budget"]),
+            bool(p["scenes"]),
+            bool(p["blueprint"]),
+        ]
     )
 
     st.markdown(
-        f"""
-        <div class="budget-preview">
-
-            <span>
-                SELECTED PRODUCTION SCALE
-            </span>
-
-            <strong>
-                ${budget_millions} Million
-            </strong>
-
-            <p>
-                {clean(budget_style)}
-            </p>
-
-        </div>
-        """,
+        '<div class="section-label">THE CONSTELLATION</div>',
         unsafe_allow_html=True,
     )
 
-    if st.button(
-        "💰 Generate Detailed Budget",
-        use_container_width=True,
+    progress_cols = st.columns(6)
+
+    for index, (label, page) in enumerate(
+        [
+            ("Studio", "Studio"),
+            ("Logline", "Logline"),
+            ("Characters", "Characters"),
+            ("Budget", "Budget"),
+            ("Screenplay", "Screenplay"),
+            ("Blueprint", "Blueprint"),
+        ]
     ):
-
-        if not budget_logline.strip():
-
-            st.warning(
-                "Please provide a logline."
-            )
-
-        elif not selected_genre.strip():
-
-            st.warning(
-                "Please provide a genre."
-            )
-
-        else:
-
-            prompt = f"""
-You are a professional film production budgeting agent.
-
-Prepare a realistic planning-level film budget.
-
-LOGLINE:
-{budget_logline}
-
-GENRE:
-{selected_genre}
-
-TOTAL TARGET BUDGET:
-${budget_millions} million USD
-
-BUDGET STRATEGY:
-{budget_style}
-
-Create department-level allocations.
-
-The percentages MUST add to exactly 100%.
-
-Adapt the allocation to the genre and story instead
-of using a generic fixed template.
-
-Return ONLY valid JSON:
-
-{{
-  "total_budget": "{budget_millions} million USD",
-  "summary": "...",
-  "departments": [
-    {{
-      "department": "...",
-      "percentage": 0,
-      "amount": "...",
-      "details": [
-        "...",
-        "...",
-        "..."
-      ]
-    }}
-  ],
-  "risk_analysis": [
-    "...",
-    "...",
-    "..."
-  ],
-  "cost_saving_options": [
-    "...",
-    "...",
-    "..."
-  ]
-}}
-"""
-
-            result = ai_json(
-                prompt,
-                temperature=0.5,
-            )
-
-            if result:
-
-                departments = safe_list(
-                    result.get("departments")
-                )
-
-                departments = [
-                    dept
-                    for dept in departments
-                    if isinstance(dept, dict)
-                ]
-
-                result["departments"] = departments
-
-                result["risk_analysis"] = (
-                    safe_list(
-                        result.get(
-                            "risk_analysis"
-                        )
-                    )
-                )
-
-                result["cost_saving_options"] = (
-                    safe_list(
-                        result.get(
-                            "cost_saving_options"
-                        )
-                    )
-                )
-
-                st.session_state.budget_result = (
-                    result
-                )
-
-                st.session_state.project_genre = (
-                    selected_genre
-                )
-
-                st.rerun()
-
-    # -----------------------------------------------------
-    # BUDGET RESULTS
-    # -----------------------------------------------------
-
-    if st.session_state.budget_result:
-
-        result = safe_dict(
-            st.session_state.budget_result
-        )
-
-        st.markdown("---")
-
-        st.markdown(
-            "### 💰 Budget Overview"
-        )
-
-        c1, c2, c3 = st.columns(3)
-
-        with c1:
-            metric_card(
-                "TOTAL BUDGET",
-                as_text(
-                    result.get(
-                        "total_budget",
-                        f"${budget_millions}M",
-                    )
-                ),
-            )
-
-        with c2:
-            metric_card(
-                "GENRE",
-                selected_genre,
-            )
-
-        with c3:
-            metric_card(
-                "STRATEGY",
-                budget_style,
-            )
-
-        card(
-            "Production Summary",
-            (
-                f"<p>"
-                f"{clean(result.get('summary'))}"
-                f"</p>"
-            ),
-            "cyan",
-        )
-
-        st.markdown(
-            "### Department Allocation"
-        )
-
-        for dept in safe_list(
-            result.get("departments")
-        ):
-
-            if not isinstance(dept, dict):
-                continue
-
-            details = "".join(
-                f"<li>{clean(x)}</li>"
-                for x in safe_list(
-                    dept.get("details")
-                )
-            )
-
-            st.markdown(
-                f"""
-                <div class="budget-row">
-
-                    <div>
-
-                        <h3>
-                            {clean(
-                                dept.get(
-                                    "department"
-                                )
-                            )}
-                        </h3>
-
-                        <p>
-                            {details}
-                        </p>
-
-                    </div>
-
-                    <div class="budget-amount">
-
-                        <strong>
-                            {clean(
-                                dept.get("amount")
-                            )}
-                        </strong>
-
-                        <span>
-                            {clean(
-                                dept.get(
-                                    "percentage"
-                                )
-                            )}%
-                        </span>
-
-                    </div>
-
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-        risk = "".join(
-            f"<li>{clean(x)}</li>"
-            for x in safe_list(
-                result.get("risk_analysis")
-            )
-        )
-
-        savings = "".join(
-            f"<li>{clean(x)}</li>"
-            for x in safe_list(
-                result.get(
-                    "cost_saving_options"
-                )
-            )
-        )
-
-        c1, c2 = st.columns(2)
-
-        with c1:
-            card(
-                "Risk Analysis",
-                f"<ul>{risk}</ul>",
-                "red",
-            )
-
-        with c2:
-            card(
-                "Cost-Saving Options",
-                f"<ul>{savings}</ul>",
-                "purple",
-            )
-
-        # -------------------------------------------------
-        # DOWNLOAD BUDGET
-        # -------------------------------------------------
-
-        budget_text = (
-            "PRODUCTION BUDGET\n\n"
-            f"Total: "
-            f"{as_text(result.get('total_budget'))}\n"
-            f"Genre: {selected_genre}\n"
-            f"Strategy: {budget_style}\n\n"
-            f"Summary:\n"
-            f"{as_text(result.get('summary'))}\n\n"
-            "DEPARTMENTS\n"
-        )
-
-        for dept in safe_list(
-            result.get("departments")
-        ):
-
-            if not isinstance(dept, dict):
-                continue
-
-            budget_text += (
-                f"\n"
-                f"{as_text(dept.get('department'))}"
-                f" — "
-                f"{as_text(dept.get('percentage'))}%"
-                f" — "
-                f"{as_text(dept.get('amount'))}\n"
-            )
-
-            for detail in safe_list(
-                dept.get("details")
+        with progress_cols[index]:
+            if st.button(
+                f"{index + 1:02d}  {label}",
+                key=f"progress_{label}",
+                use_container_width=True,
             ):
-
-                budget_text += (
-                    f"  - {detail}\n"
-                )
-
-        budget_text += (
-            "\nRISK ANALYSIS\n"
-        )
-
-        for item in safe_list(
-            result.get("risk_analysis")
-        ):
-
-            budget_text += (
-                f"- {item}\n"
-            )
-
-        budget_text += (
-            "\nCOST-SAVING OPTIONS\n"
-        )
-
-        for item in safe_list(
-            result.get(
-                "cost_saving_options"
-            )
-        ):
-
-            budget_text += (
-                f"- {item}\n"
-            )
-
-        text_download(
-            "⬇️ Download Production Budget",
-            budget_text,
-            "production_budget.txt",
-        )
-
-
-# =========================================================
-# SCREENPLAY LAB
-# =========================================================
-
-elif st.session_state.page == "Screenplay Lab":
-
-    section_title(
-        "04",
-        "Screenplay Lab",
-        "Generate a complete scene-by-scene screenplay from the approved logline.",
-    )
-
-    screenplay_logline = (
-        st.session_state.selected_logline
-    )
-
-    if not screenplay_logline:
-
-        screenplay_logline = st.text_area(
-            "Movie logline",
-            placeholder=(
-                "Paste the final logline..."
-            ),
-            height=120,
-            key="screenplay_manual_logline",
-        )
-
-    else:
-
-        screenplay_logline = st.text_area(
-            "Movie logline",
-            value=screenplay_logline,
-            height=120,
-            key="screenplay_logline",
-        )
-
-    selected_genre = st.selectbox(
-        "Genre",
-        GENRE_OPTIONS,
-        index=(
-            GENRE_OPTIONS.index(
-                st.session_state.project_genre
-            )
-            if st.session_state.project_genre
-            in GENRE_OPTIONS
-            else 0
-        ),
-        key="screenplay_genre",
-    )
-
-    if selected_genre == "Custom Genre":
-
-        selected_genre = st.text_input(
-            "Enter custom genre",
-            key="screenplay_custom_genre",
-        )
-
-    c1, c2 = st.columns(2)
-
-    with c1:
-
-        scene_count = st.slider(
-            "Number of scenes",
-            5,
-            20,
-            10,
-            key="screenplay_scene_count",
-        )
-
-    with c2:
-
-        screenplay_length = st.select_slider(
-            "Scene detail",
-            options=[
-                "Compact",
-                "Detailed",
-                "Very Detailed",
-            ],
-            value="Detailed",
-            key="screenplay_detail",
-        )
-
-    if st.button(
-        "📜 Generate Complete Screenplay",
-        use_container_width=True,
-    ):
-
-        if not screenplay_logline.strip():
-
-            st.warning(
-                "Please provide a logline."
-            )
-
-        elif not selected_genre.strip():
-
-            st.warning(
-                "Please provide a genre."
-            )
-
-        else:
-
-            prompt = f"""
-You are a professional screenwriter.
-
-Write a coherent screenplay based ONLY on this
-story foundation.
-
-LOGLINE:
-{screenplay_logline}
-
-GENRE:
-{selected_genre}
-
-NUMBER OF SCENES:
-{scene_count}
-
-DETAIL LEVEL:
-{screenplay_length}
-
-Create exactly {scene_count} scenes across three acts.
-
-Every scene must contain:
-
-- scene number
-- INT./EXT. heading
-- location
-- time
-- action/visual description
-- characters present
-- meaningful dialogue
-- parentheticals only when useful
-- scene purpose / progression
-
-The story must have continuity.
-
-Characters should behave consistently.
-
-Do not skip scenes.
-
-Do not summarize the dialogue.
-
-Give actual dialogue for every important exchange.
-
-Return ONLY valid JSON:
-
-{{
-  "title": "...",
-  "genre": "...",
-  "logline": "...",
-  "acts": [
-    {{
-      "act": "ACT I",
-      "purpose": "...",
-      "scenes": [
-        {{
-          "scene_number": 1,
-          "heading": "INT. ... - NIGHT",
-          "location": "...",
-          "time": "...",
-          "characters": ["..."],
-          "action": "...",
-          "dialogue": [
-            {{
-              "character": "...",
-              "parenthetical": "",
-              "line": "..."
-            }}
-          ],
-          "scene_purpose": "..."
-        }}
-      ]
-    }}
-  ]
-}}
-"""
-
-            result = ai_json(
-                prompt,
-                temperature=0.85,
-            )
-
-            if result:
-
-                acts = safe_list(
-                    result.get("acts")
-                )
-
-                valid_acts = []
-
-                for act in acts:
-
-                    if not isinstance(act, dict):
-                        continue
-
-                    scenes = safe_list(
-                        act.get("scenes")
-                    )
-
-                    valid_scenes = [
-                        scene
-                        for scene in scenes
-                        if isinstance(scene, dict)
-                    ]
-
-                    act["scenes"] = valid_scenes
-
-                    valid_acts.append(act)
-
-                result["acts"] = valid_acts
-
-                st.session_state.screenplay_result = (
-                    result
-                )
-
-                st.session_state.project_genre = (
-                    selected_genre
-                )
-
+                st.session_state.page = page
                 st.rerun()
 
-    # -----------------------------------------------------
-    # SCREENPLAY RESULTS
-    # -----------------------------------------------------
+    st.metric("PROJECT PROGRESS", f"{complete}/6", "rooms developed")
 
-    if st.session_state.screenplay_result:
+    left, right = st.columns([1.2, 0.8])
 
-        result = safe_dict(
-            st.session_state.screenplay_result
-        )
-
-        st.markdown("---")
-
+    with left:
         st.markdown(
             f"""
-            <div class="screenplay-title">
-
-                <span>
-                    {clean(
-                        result.get(
-                            "genre",
-                            selected_genre,
-                        )
-                    )}
-                </span>
-
-                <h2>
-                    {clean(
-                        result.get(
-                            "title",
-                            "Untitled Screenplay",
-                        )
-                    )}
-                </h2>
-
-                <p>
-                    {clean(
-                        result.get(
-                            "logline",
-                            screenplay_logline,
-                        )
-                    )}
-                </p>
-
+            <div class="glass-card large-card">
+              <div class="label violet">CURRENT PROJECT</div>
+              <h2>{p["title"]}</h2>
+              <div class="status-pill">
+                {'In development' if p['idea'] else 'Waiting for a spark'}
+              </div>
+              <p>
+                {p["idea"] or "Your first image belongs here. A question, a character, a place that should not exist — start with the detail you cannot stop seeing."}
+              </p>
             </div>
             """,
             unsafe_allow_html=True,
         )
 
-        for act in safe_list(
-            result.get("acts")
-        ):
+    with right:
+        statuses = [
+            ("Raw idea", "Captured" if p["idea"] else "Awaiting"),
+            ("Emotional spine", "Chosen" if p["selected_logline"] else "Open"),
+            ("Production reality", "Scoped" if p["budget"] else "Open"),
+        ]
 
-            if not isinstance(act, dict):
-                continue
-
-            st.markdown(
-                f"""
-                <div class="act-header">
-                    {clean(
-                        act.get("act")
-                    )}
-
-                    <span>
-                        {clean(
-                            act.get("purpose")
-                        )}
-                    </span>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-            for scene in safe_list(
-                act.get("scenes")
-            ):
-
-                if not isinstance(scene, dict):
-                    continue
-
-                st.markdown(
-                    f"""
-                    <div class="scene-block">
-
-                        <div class="scene-heading">
-                            {clean(
-                                scene.get(
-                                    "heading"
-                                )
-                            )}
-                        </div>
-
-                        <div class="scene-location">
-                            {clean(
-                                scene.get(
-                                    "location"
-                                )
-                            )}
-                            •
-                            {clean(
-                                scene.get(
-                                    "time"
-                                )
-                            )}
-                        </div>
-
-                        <div class="action-text">
-                            {clean(
-                                scene.get(
-                                    "action"
-                                )
-                            )}
-                        </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-
-                for line in safe_list(
-                    scene.get("dialogue")
-                ):
-
-                    if not isinstance(line, dict):
-                        continue
-
-                    parenthetical = as_text(
-                        line.get(
-                            "parenthetical"
-                        )
-                    )
-
-                    if parenthetical:
-
-                        p_html = (
-                            f"""
-                            <div class="parenthetical">
-                                ({clean(parenthetical)})
-                            </div>
-                            """
-                        )
-
-                    else:
-
-                        p_html = ""
-
-                    st.markdown(
-                        f"""
-                        <div class="dialogue-block">
-
-                            <div class="character-cue">
-                                {clean(
-                                    line.get(
-                                        "character"
-                                    )
-                                )}
-                            </div>
-
-                            {p_html}
-
-                            <div class="dialogue-text">
-                                {clean(
-                                    line.get(
-                                        "line"
-                                    )
-                                )}
-                            </div>
-
-                        </div>
-                        """,
-                        unsafe_allow_html=True,
-                    )
-
-                st.markdown(
-                    f"""
-                    <div class="scene-purpose">
-                        <b>Scene purpose:</b>
-                        {clean(
-                            scene.get(
-                                "scene_purpose"
-                            )
-                        )}
-                    </div>
-
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-
-        # -------------------------------------------------
-        # DOWNLOAD SCREENPLAY
-        # -------------------------------------------------
-
-        screenplay_text = (
-            f"{as_text(result.get('title'), 'Untitled')}\n"
-            f"GENRE: "
-            f"{as_text(result.get('genre'), selected_genre)}\n"
-            f"LOGLINE: "
-            f"{as_text(result.get('logline'), screenplay_logline)}\n\n"
+        rows = "".join(
+            f'<div class="status-row"><span>{label}</span>'
+            f"<strong>{value}</strong></div>"
+            for label, value in statuses
         )
 
-        for act in safe_list(
-            result.get("acts")
-        ):
-
-            if not isinstance(act, dict):
-                continue
-
-            screenplay_text += (
-                f"\n\n"
-                f"{as_text(act.get('act'))}\n"
-                f"{as_text(act.get('purpose'))}\n\n"
-            )
-
-            for scene in safe_list(
-                act.get("scenes")
-            ):
-
-                if not isinstance(scene, dict):
-                    continue
-
-                screenplay_text += (
-                    f"SCENE "
-                    f"{as_text(scene.get('scene_number'))}"
-                    f" — "
-                    f"{as_text(scene.get('heading'))}\n"
-                    f"{as_text(scene.get('location'))}"
-                    f" • "
-                    f"{as_text(scene.get('time'))}\n\n"
-                    f"{as_text(scene.get('action'))}\n\n"
-                )
-
-                for line in safe_list(
-                    scene.get("dialogue")
-                ):
-
-                    if not isinstance(line, dict):
-                        continue
-
-                    character = as_text(
-                        line.get("character")
-                    )
-
-                    parenthetical = as_text(
-                        line.get(
-                            "parenthetical"
-                        )
-                    )
-
-                    dialogue_line = as_text(
-                        line.get("line")
-                    )
-
-                    screenplay_text += (
-                        f"        {character}\n"
-                    )
-
-                    if parenthetical:
-
-                        screenplay_text += (
-                            f"        "
-                            f"({parenthetical})\n"
-                        )
-
-                    screenplay_text += (
-                        f"        "
-                        f"{dialogue_line}\n\n"
-                    )
-
-                screenplay_text += (
-                    f"Scene purpose: "
-                    f"{as_text(scene.get('scene_purpose'))}"
-                    f"\n\n"
-                )
-
-        text_download(
-            "⬇️ Download Complete Screenplay",
-            screenplay_text,
-            "complete_screenplay.txt",
+        st.markdown(
+            f"""
+            <div class="glass-card">
+              <div class="section-label">INSIDE THE ROOM</div>
+              {rows}
+              <p class="fine-print">
+                Nothing leaves this browser unless you export it.
+              </p>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
 
 
-# =========================================================
-# MASTER BLUEPRINT
-# =========================================================
+def render_logline() -> None:
+    p = project()
 
-elif st.session_state.page == "Master Blueprint":
-
-    section_title(
-        "05",
-        "Master Blueprint",
-        "The final production document: characters, screenplay, dialogue, budget and story structure in one place.",
-    )
-
-    blueprint_logline = (
-        st.session_state.selected_logline
-    )
-
-    if not blueprint_logline:
-
-        blueprint_logline = st.text_area(
-            "Final movie logline",
-            placeholder=(
-                "Paste the approved final logline..."
-            ),
-            height=130,
-            key="master_manual_logline",
-        )
-
-    else:
-
-        blueprint_logline = st.text_area(
-            "Final movie logline",
-            value=blueprint_logline,
-            height=130,
-            key="master_logline",
-        )
-
-    selected_genre = st.selectbox(
-        "Genre",
-        GENRE_OPTIONS,
-        index=(
-            GENRE_OPTIONS.index(
-                st.session_state.project_genre
-            )
-            if st.session_state.project_genre
-            in GENRE_OPTIONS
-            else 0
-        ),
-        key="master_genre",
-    )
-
-    if selected_genre == "Custom Genre":
-
-        selected_genre = st.text_input(
-            "Enter custom genre",
-            key="master_custom_genre",
-        )
-
-    c1, c2, c3 = st.columns(3)
-
-    with c1:
-
-        cast_size = st.slider(
-            "Characters",
-            3,
-            12,
-            7,
-            key="master_cast_size",
-        )
-
-    with c2:
-
-        scene_count = st.slider(
-            "Scenes",
-            6,
-            24,
-            12,
-            key="master_scene_count",
-        )
-
-    with c3:
-
-        budget_millions = st.slider(
-            "Budget ($M)",
-            1,
-            300,
-            50,
-            key="master_budget",
-        )
-
-    tone = st.select_slider(
-        "Overall cinematic tone",
-        options=[
-            "Warm",
-            "Hopeful",
-            "Cinematic",
-            "Dark",
-            "Intense",
-            "Bleak",
-        ],
-        value="Cinematic",
-        key="master_tone",
+    page_intro(
+        "01",
+        "premise lab",
+        "Find the story hiding inside the idea.",
+        "Three directions. Three emotional contracts. Choose the one you would follow into the dark.",
     )
 
     st.info(
-        "The Master Blueprint is intentionally comprehensive. "
-        "A large blueprint can use a significant amount of Gemini output quota."
+        f"Raw material  ·  "
+        f"{p['idea'] or 'No idea captured yet — start in Studio.'}"
     )
 
-    if st.button(
-        "🚀 Generate Complete Master Blueprint",
-        use_container_width=True,
+    if button("✦ Develop directions", "generate_loglines", primary=True):
+        with st.spinner("The room is developing three directions..."):
+            result = generate_json(
+                f"""You are a story editor. From this raw idea, create three sharply different film directions:
+RAW IDEA: {p['idea'] or 'A person receives a message from a place that no longer exists.'}
+Return JSON with a loglines array. Each item must have title, text, genre, and audience. Keep text to one vivid sentence.""",
+                0.88,
+            )
+
+        if result:
+            items = result.get("loglines", []) if isinstance(result, dict) else []
+
+            update_project(
+                loglines=items or seed_loglines(),
+                last_generated="logline",
+            )
+
+            st.rerun()
+
+    if not p["loglines"]:
+        empty_state(
+            "The page is still blank.",
+            "Give the creative partner one image to push against. The best direction usually arrives sideways.",
+        )
+        return
+
+    for index, line in enumerate(p["loglines"]):
+        if not isinstance(line, dict):
+            continue
+
+        line_id = str(index)
+        selected = p["selected_logline"] == line_id
+
+        with st.container(border=True):
+            st.markdown(
+                f"""
+                <div class="label cyan">
+                  DIRECTION {index + 1:02d} ·
+                  {line.get("genre", "FILM DIRECTION")}
+                </div>
+                <h2 class="card-title">
+                  {line.get("title", "Untitled direction")}
+                </h2>
+                <p class="editorial">{line.get("text", "")}</p>
+                <p class="audience">
+                  <b>Audience note:</b>
+                  {line.get("audience", "An audience ready for something specific.")}
+                </p>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            if st.button(
+                "✓ Selected direction" if selected else "Choose this direction  →",
+                key=f"select_logline_{index}",
+            ):
+                update_project(selected_logline=line_id)
+                st.rerun()
+
+
+def render_characters() -> None:
+    p = project()
+
+    page_intro(
+        "02",
+        "character vault",
+        "Give the story people who can break it.",
+        "A cast is not a list of traits. It is a pressure system — wants colliding until everyone tells the truth.",
+    )
+
+    if button(
+        "✦ Build / regenerate ensemble",
+        "generate_characters",
+        primary=True,
     ):
-
-        if not blueprint_logline.strip():
-
-            st.warning(
-                "Please provide the final logline."
+        with st.spinner("Casting the ensemble..."):
+            result = generate_json(
+                f"""Act as a casting director and dramaturg. Build three compelling characters for:
+FILM IDEA: {p['idea']}
+CHOSEN DIRECTION: {p['loglines'][int(p['selected_logline'])]['text'] if p['selected_logline'] and p['loglines'] else 'an intimate speculative thriller'}
+Return JSON with a characters array. Each item must have name, role, want, flaw, and arc.""",
+                0.8,
             )
 
-        elif not selected_genre.strip():
+        if result:
+            items = result.get("characters", []) if isinstance(result, dict) else []
 
-            st.warning(
-                "Please provide a genre."
+            update_project(
+                characters=items or seed_characters(),
+                last_generated="characters",
             )
 
-        else:
+            st.rerun()
 
-            prompt = f"""
-You are the MASTER AI FILM DEVELOPMENT AGENT.
+    if not p["characters"]:
+        empty_state(
+            "No one is in the frame yet.",
+            "Build the ensemble from your chosen direction. Give them a desire that makes the plot unavoidable.",
+        )
+        return
 
-Build a complete movie blueprint from this approved
-logline.
+    columns = st.columns(3)
 
-LOGLINE:
-{blueprint_logline}
+    for index, char in enumerate(p["characters"]):
+        with columns[index % 3]:
+            initials = "".join(
+                word[0] for word in char.get("name", "New voice").split()
+            )[:2].upper()
 
-GENRE:
-{selected_genre}
+            st.markdown(
+                f"""
+                <div class="glass-card character-card">
+                  <div class="avatar">{initials}</div>
+                  <div class="label cyan">
+                    {char.get("role", "NEW VOICE")}
+                  </div>
+                  <h2>{char.get("name", "Unnamed character")}</h2>
 
-TONE:
-{tone}
+                  <div class="character-field">
+                    <span>WANT</span>
+                    {char.get("want", "")}
+                  </div>
 
-MAIN CHARACTERS:
-{cast_size}
+                  <div class="character-field">
+                    <span>FLAW</span>
+                    {char.get("flaw", "")}
+                  </div>
 
-SCENES:
-{scene_count}
-
-TARGET PRODUCTION BUDGET:
-${budget_millions} million USD
-
-The result must be a complete production blueprint,
-not a short summary.
-
-Include:
-
-1. Movie title
-2. One-sentence logline
-3. Theme
-4. Tone
-5. World / setting
-6. Full cast with every important character
-7. Character goals, flaws, arcs and relationships
-8. Three-act story structure
-9. Every scene in sequence
-10. Action and visual direction for every scene
-11. Every important dialogue exchange
-12. Production budget with department allocation
-13. Key production risks
-14. Final ending / resolution
-
-Do not say:
-- etc.
-- and so on
-- dialogue continues
-- more scenes
-
-Do not leave placeholders.
-
-Actually write the content.
-
-Return ONLY valid JSON:
-
-{{
-  "title": "...",
-  "logline": "...",
-  "theme": "...",
-  "tone": "...",
-  "world": "...",
-
-  "characters": [
-    {{
-      "name": "...",
-      "role": "...",
-      "age": "...",
-      "personality": "...",
-      "goal": "...",
-      "need": "...",
-      "flaw": "...",
-      "backstory": "...",
-      "arc": "...",
-      "relationships": "...",
-      "dialogue_voice": "..."
-    }}
-  ],
-
-  "acts": [
-    {{
-      "act": "ACT I",
-      "purpose": "...",
-      "scenes": [
-        {{
-          "scene_number": 1,
-          "heading": "INT./EXT. ... - DAY/NIGHT",
-          "action": "...",
-          "characters": ["..."],
-          "dialogue": [
-            {{
-              "character": "...",
-              "parenthetical": "",
-              "line": "..."
-            }}
-          ],
-          "purpose": "..."
-        }}
-      ]
-    }}
-  ],
-
-  "budget": {{
-    "total": "${budget_millions} million USD",
-    "departments": [
-      {{
-        "department": "...",
-        "percentage": 0,
-        "amount": "...",
-        "details": "..."
-      }}
-    ],
-    "risks": [
-      "...",
-      "...",
-      "..."
-    ]
-  }},
-
-  "ending": "..."
-}}
-"""
-
-            result = ai_json(
-                prompt,
-                temperature=0.8,
+                  <div class="character-field arc">
+                    <span>ARC</span>
+                    {char.get("arc", "")}
+                  </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
             )
+
+            if st.button("Remove", key=f"remove_character_{index}"):
+                update_project(
+                    characters=[
+                        c for i, c in enumerate(p["characters"]) if i != index
+                    ]
+                )
+                st.rerun()
+
+    new_name = st.text_input(
+        "Add a name to the ensemble",
+        key="new_character",
+    )
+
+    if button("＋ Add character", "add_character"):
+        if new_name.strip():
+            update_project(
+                characters=[
+                    *p["characters"],
+                    {
+                        "name": new_name.strip(),
+                        "role": "New voice",
+                        "want": "To be discovered.",
+                        "flaw": "Still in development.",
+                        "arc": "To be written in the room.",
+                    },
+                ]
+            )
+            st.rerun()
+
+
+def render_budget() -> None:
+    p = project()
+
+    page_intro(
+        "03",
+        "production reality",
+        "Protect the feeling. Price the frame.",
+        "A useful budget does not flatten ambition. It shows you where the film gets to be precise — and what it must refuse.",
+    )
+
+    left, right = st.columns([0.8, 1.2])
+
+    with left:
+        scale = st.selectbox(
+            "Scale",
+            [
+                "Contained / elevated",
+                "Independent feature",
+                "Studio genre film",
+            ],
+            key="budget_scale",
+        )
+
+        runtime = st.text_input(
+            "Runtime",
+            value=p["budget"]["runtime"] if p["budget"] else "105 minutes",
+            key="budget_runtime",
+        )
+
+        locations = st.text_input(
+            "Locations & production footprint",
+            value=(
+                p["budget"]["locations"]
+                if p["budget"]
+                else "6 practical locations"
+            ),
+            key="budget_locations",
+        )
+
+        if button(
+            "✦ Scope the production",
+            "generate_budget",
+            primary=True,
+        ):
+            with st.spinner(
+                "The line producer is building a grounded range..."
+            ):
+                result = generate_json(
+                    f"""You are a line producer. Create a grounded preliminary film budget for {p['title']} based on {p['idea']}. Scale: {scale}; runtime: {runtime}; locations: {locations}. Return JSON with total, rows (label, amount, note), and note. Use realistic USD amounts.""",
+                    0.35,
+                )
 
             if result:
+                fallback = {
+                    "total": "$2.48M",
+                    "rows": [
+                        {
+                            "label": "Above the line",
+                            "amount": "$642,000",
+                            "note": (
+                                "Cast, director, story rights, development"
+                            ),
+                        },
+                        {
+                            "label": "Production",
+                            "amount": "$1,126,500",
+                            "note": (
+                                "Crew, stages, locations, camera and practical effects"
+                            ),
+                        },
+                        {
+                            "label": "Post-production",
+                            "amount": "$488,000",
+                            "note": (
+                                "Edit, score, grade, sound design and delivery"
+                            ),
+                        },
+                        {
+                            "label": "Contingency",
+                            "amount": "$223,500",
+                            "note": "9% reserve for the impossible day",
+                        },
+                    ],
+                    "note": (
+                        "The money is on the world-building and the sound. "
+                        "Keep the camera close; let the unseen do the expensive work."
+                    ),
+                }
 
-                # -----------------------------------------
-                # NORMALIZE MASTER DATA
-                # -----------------------------------------
-
-                characters = safe_list(
-                    result.get("characters")
-                )
-
-                result["characters"] = [
-                    character
-                    for character in characters
-                    if isinstance(character, dict)
-                ]
-
-                acts = safe_list(
-                    result.get("acts")
-                )
-
-                valid_acts = []
-
-                for act in acts:
-
-                    if not isinstance(act, dict):
-                        continue
-
-                    scenes = safe_list(
-                        act.get("scenes")
-                    )
-
-                    act["scenes"] = [
-                        scene
-                        for scene in scenes
-                        if isinstance(scene, dict)
-                    ]
-
-                    valid_acts.append(act)
-
-                result["acts"] = valid_acts
-
-                budget = safe_dict(
-                    result.get("budget")
-                )
-
-                departments = safe_list(
-                    budget.get("departments")
-                )
-
-                budget["departments"] = [
-                    dept
-                    for dept in departments
-                    if isinstance(dept, dict)
-                ]
-
-                budget["risks"] = safe_list(
-                    budget.get("risks")
-                )
-
-                result["budget"] = budget
-
-                st.session_state.blueprint_result = (
-                    result
-                )
-
-                st.session_state.project_genre = (
-                    selected_genre
-                )
-
-                st.session_state.project_tone = (
-                    tone
+                update_project(
+                    budget={
+                        **fallback,
+                        "scale": scale,
+                        "runtime": runtime,
+                        "locations": locations,
+                    },
+                    last_generated="budget",
                 )
 
                 st.rerun()
 
-    # -----------------------------------------------------
-    # BLUEPRINT RESULTS
-    # -----------------------------------------------------
+    with right:
+        if not p["budget"]:
+            empty_state(
+                "The numbers have not entered the room.",
+                "Set the shape of the production first. The estimate will follow the story, not the other way around.",
+            )
+        else:
+            budget = p["budget"]
 
-    if st.session_state.blueprint_result:
+            st.markdown(
+                f"""
+                <div class="budget-total">
+                  <div class="label">PRELIMINARY PRODUCTION RANGE</div>
+                  <div class="amount">{budget["total"]}</div>
+                  <div class="fine-print">
+                    {budget["scale"]} · {budget["runtime"]}
+                  </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
-        result = safe_dict(
-            st.session_state.blueprint_result
+            for row in budget["rows"]:
+                st.markdown(
+                    f"""
+                    <div class="budget-row">
+                      <div>
+                        <strong>{row["label"]}</strong>
+                        <small>{row["note"]}</small>
+                      </div>
+                      <b>{row["amount"]}</b>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+            st.markdown(
+                f"""
+                <div class="producer-note">
+                  <div class="label violet">PRODUCER’S NOTE</div>
+                  {budget.get("note", "")}
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+
+def render_screenplay() -> None:
+    p = project()
+
+    page_intro(
+        "04",
+        "page one",
+        "Let the camera discover the story.",
+        "Build the screenplay in playable moments. Every scene should arrive with a question and leave a different one behind.",
+    )
+
+    if button(
+        "✦ Write opening movement",
+        "generate_screenplay",
+        primary=True,
+    ):
+        with st.spinner("The screenwriter is finding the first image..."):
+            result = generate_json(
+                f"""You are a screenwriter with a precise visual voice. Write three opening scenes from this idea: {p['idea']}. Direction: {p['loglines'][int(p['selected_logline'])]['text'] if p['selected_logline'] and p['loglines'] else 'a signal from a dead sector'}. Return JSON with scenes, each containing heading, location, action, dialogue, and purpose. Keep it playable and specific.""",
+                0.72,
+            )
+
+        if result:
+            items = result.get("scenes", []) if isinstance(result, dict) else []
+
+            update_project(
+                scenes=items or seed_scenes(),
+                last_generated="screenplay",
+            )
+
+            st.rerun()
+
+    if not p["scenes"]:
+        empty_state(
+            "The page is waiting for action.",
+            "A screenplay begins with where we are, what we see, and the detail no one in the room can explain.",
         )
+        return
 
-        st.markdown("---")
+    for index, scene in enumerate(p["scenes"]):
+        with st.container(border=True):
+            st.markdown(
+                f'<div class="label violet">SCENE {index + 1:02d} · DRAFT</div>',
+                unsafe_allow_html=True,
+            )
 
+            heading = st.text_input(
+                "Scene heading",
+                value=scene.get("heading", ""),
+                key=f"scene_heading_{index}",
+            )
+
+            location = st.text_input(
+                "Location",
+                value=scene.get("location", ""),
+                key=f"scene_location_{index}",
+            )
+
+            action = st.text_area(
+                "Action",
+                value=scene.get("action", ""),
+                height=150,
+                key=f"scene_action_{index}",
+            )
+
+            dialogue = st.text_area(
+                "Dialogue",
+                value=scene.get("dialogue", ""),
+                height=110,
+                key=f"scene_dialogue_{index}",
+            )
+
+            purpose = st.text_input(
+                "Dramatic purpose",
+                value=scene.get("purpose", ""),
+                key=f"scene_purpose_{index}",
+            )
+
+            p["scenes"][index] = {
+                "heading": heading,
+                "location": location,
+                "action": action,
+                "dialogue": dialogue,
+                "purpose": purpose,
+            }
+
+            if st.button("Remove scene", key=f"remove_scene_{index}"):
+                update_project(
+                    scenes=[
+                        s for i, s in enumerate(p["scenes"]) if i != index
+                    ]
+                )
+                st.rerun()
+
+    if button("＋ Add scene", "add_scene"):
+        update_project(
+            scenes=[
+                *p["scenes"],
+                {
+                    "heading": "INT. NEW LOCATION",
+                    "location": "TIME / ATMOSPHERE",
+                    "action": "Describe what the camera finds.",
+                    "dialogue": (
+                        "CHARACTER\n"
+                        "Write the pressure point here."
+                    ),
+                    "purpose": (
+                        "What changes because this scene exists?"
+                    ),
+                },
+            ]
+        )
+        st.rerun()
+
+
+def render_blueprint() -> None:
+    p = project()
+
+    page_intro(
+        "05",
+        "the master document",
+        "Everything the film knows, in one frame.",
+        "The blueprint is the handoff between a fragile idea and a production that can protect it.",
+    )
+
+    export_col, generate_col = st.columns([1, 1])
+
+    with export_col:
+        if button("↓ Export .txt", "export_blueprint"):
+            text = f"""{p['title'].upper()}
+
+MASTER PRODUCTION BLUEPRINT
+
+{p['idea']}
+
+LOGLINE
+{next((line.get('text', '') for i, line in enumerate(p['loglines']) if str(i) == str(p['selected_logline'])), 'Not selected')}
+
+CHARACTERS
+{chr(10).join(f"{c.get('name')} — {c.get('role')}\nWant: {c.get('want')}\nArc: {c.get('arc')}" for c in p['characters'])}
+
+SCREENPLAY
+{chr(10).join(f"{s.get('heading')}\n{s.get('action')}\n{s.get('dialogue')}" for s in p['scenes'])}
+
+BUDGET
+{p['budget']['total'] if p['budget'] else 'Not scoped'}
+"""
+
+            st.download_button(
+                "Download blueprint",
+                text,
+                file_name=f"{p['title'].replace(' ', '-').lower()}-blueprint.txt",
+                mime="text/plain",
+                key="download_blueprint",
+            )
+
+    with generate_col:
+        if button(
+            "✦ Synthesize blueprint",
+            "generate_blueprint",
+            primary=True,
+        ):
+            with st.spinner(
+                "The development executive is assembling the handoff..."
+            ):
+                result = generate_json(
+                    f"""You are a senior development executive. Assemble a concise production blueprint for {p['title']}. Idea: {p['idea']}. Include central promise, emotional engine, visual language, and one decisive production principle. Return JSON with a blueprint string.""",
+                    0.55,
+                )
+
+            if result:
+                update_project(
+                    blueprint=result.get(
+                        "blueprint",
+                        result.get("raw", ""),
+                    ),
+                    last_generated="blueprint",
+                )
+                st.rerun()
+
+    selected_text = next(
+        (
+            line.get("text", "")
+            for i, line in enumerate(p["loglines"])
+            if str(i) == str(p["selected_logline"])
+        ),
+        "Choose a logline direction to focus the room.",
+    )
+
+    st.markdown(
+        f"""
+        <div class="blueprint-header">
+          <div class="label cyan">MASTER PRODUCTION BLUEPRINT</div>
+          <h2>{p["title"]}</h2>
+          <p>
+            {p["idea"] or "A film waiting for its first impossible detail."}
+          </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    a, b, c = st.columns(3)
+
+    with a:
         st.markdown(
             f"""
-            <div class="blueprint-hero">
-
-                <div class="blueprint-label">
-                    MASTER PRODUCTION BLUEPRINT
-                </div>
-
-                <h1>
-                    {clean(
-                        result.get(
-                            "title",
-                            "Untitled Film",
-                        )
-                    )}
-                </h1>
-
-                <p>
-                    {clean(
-                        result.get(
-                            "logline",
-                            blueprint_logline,
-                        )
-                    )}
-                </p>
-
+            <div class="blueprint-stat">
+              <span>STORY DIRECTION</span>
+              <p>{selected_text}</p>
             </div>
             """,
             unsafe_allow_html=True,
         )
 
-        characters = safe_list(
-            result.get("characters")
-        )
-
-        acts = safe_list(
-            result.get("acts")
-        )
-
-        budget = safe_dict(
-            result.get("budget")
-        )
-
-        total_scenes = 0
-
-        for act in acts:
-
-            if isinstance(act, dict):
-
-                total_scenes += len(
-                    [
-                        scene
-                        for scene in safe_list(
-                            act.get("scenes")
-                        )
-                        if isinstance(scene, dict)
-                    ]
-                )
-
-        c1, c2, c3, c4 = st.columns(4)
-
-        with c1:
-
-            metric_card(
-                "GENRE",
-                selected_genre,
-            )
-
-        with c2:
-
-            metric_card(
-                "CHARACTERS",
-                len(characters),
-            )
-
-        with c3:
-
-            metric_card(
-                "SCENES",
-                total_scenes,
-            )
-
-        with c4:
-
-            metric_card(
-                "BUDGET",
-                as_text(
-                    budget.get(
-                        "total",
-                        f"${budget_millions}M",
-                    )
-                ),
-            )
-
-        card(
-            "Theme",
-            (
-                f"<p>"
-                f"{clean(result.get('theme'))}"
-                f"</p>"
-            ),
-            "purple",
-        )
-
-        card(
-            "World & Setting",
-            (
-                f"<p>"
-                f"{clean(result.get('world'))}"
-                f"</p>"
-            ),
-            "cyan",
-        )
-
-        # -------------------------------------------------
-        # CHARACTERS
-        # -------------------------------------------------
-
+    with b:
         st.markdown(
-            "## 🎭 Every Character"
+            f"""
+            <div class="blueprint-stat">
+              <span>ENSEMBLE</span>
+              <strong>{len(p["characters"]) or "—"}</strong>
+              <small>voices in the frame</small>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
 
-        for i, character in enumerate(
-            characters,
-            1,
-        ):
-
-            if not isinstance(
-                character,
-                dict,
-            ):
-                continue
-
-            relationships = character.get(
-                "relationships"
-            )
-
-            if isinstance(
-                relationships,
-                list,
-            ):
-
-                relationships = ", ".join(
-                    str(x)
-                    for x in relationships
-                )
-
-            st.markdown(
-                f"""
-                <div class="blueprint-character">
-
-                    <div class="character-number">
-                        #{i}
-                    </div>
-
-                    <div>
-
-                        <div class="character-role">
-                            {clean(
-                                character.get(
-                                    "role"
-                                )
-                            )}
-                        </div>
-
-                        <h3>
-                            {clean(
-                                character.get(
-                                    "name"
-                                )
-                            )}
-                        </h3>
-
-                        <p>
-                            <b>Age:</b>
-                            {clean(
-                                character.get(
-                                    "age"
-                                )
-                            )}
-                        </p>
-
-                        <p>
-                            <b>Personality:</b>
-                            {clean(
-                                character.get(
-                                    "personality"
-                                )
-                            )}
-                        </p>
-
-                        <p>
-                            <b>Goal:</b>
-                            {clean(
-                                character.get(
-                                    "goal"
-                                )
-                            )}
-                        </p>
-
-                        <p>
-                            <b>Need:</b>
-                            {clean(
-                                character.get(
-                                    "need"
-                                )
-                            )}
-                        </p>
-
-                        <p>
-                            <b>Flaw:</b>
-                            {clean(
-                                character.get(
-                                    "flaw"
-                                )
-                            )}
-                        </p>
-
-                        <p>
-                            <b>Backstory:</b>
-                            {clean(
-                                character.get(
-                                    "backstory"
-                                )
-                            )}
-                        </p>
-
-                        <p>
-                            <b>Arc:</b>
-                            {clean(
-                                character.get(
-                                    "arc"
-                                )
-                            )}
-                        </p>
-
-                        <p>
-                            <b>Relationships:</b>
-                            {clean(
-                                relationships
-                            )}
-                        </p>
-
-                        <p>
-                            <b>Dialogue Voice:</b>
-                            {clean(
-                                character.get(
-                                    "dialogue_voice"
-                                )
-                            )}
-                        </p>
-
-                    </div>
-
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-        # -------------------------------------------------
-        # SCREENPLAY
-        # -------------------------------------------------
-
+    with c:
         st.markdown(
-            "## 🎬 Complete Screenplay & Dialogue"
+            f"""
+            <div class="blueprint-stat">
+              <span>PRODUCTION RANGE</span>
+              <strong>{p["budget"]["total"] if p["budget"] else "—"}</strong>
+              <small>{len(p["scenes"])} drafted scenes</small>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
 
-        for act in acts:
-
-            if not isinstance(
-                act,
-                dict,
-            ):
-                continue
-
-            st.markdown(
-                f"""
-                <div class="act-header">
-
-                    {clean(
-                        act.get("act")
-                    )}
-
-                    <span>
-                        {clean(
-                            act.get("purpose")
-                        )}
-                    </span>
-
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-            for scene in safe_list(
-                act.get("scenes")
-            ):
-
-                if not isinstance(
-                    scene,
-                    dict,
-                ):
-                    continue
-
-                st.markdown(
-                    f"""
-                    <div class="scene-block">
-
-                        <div class="scene-heading">
-                            SCENE
-                            {clean(
-                                scene.get(
-                                    "scene_number"
-                                )
-                            )}
-                            —
-                            {clean(
-                                scene.get(
-                                    "heading"
-                                )
-                            )}
-                        </div>
-
-                        <div class="action-text">
-                            {clean(
-                                scene.get(
-                                    "action"
-                                )
-                            )}
-                        </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-
-                for line in safe_list(
-                    scene.get("dialogue")
-                ):
-
-                    if not isinstance(
-                        line,
-                        dict,
-                    ):
-                        continue
-
-                    parenthetical = as_text(
-                        line.get(
-                            "parenthetical"
-                        )
-                    )
-
-                    if parenthetical:
-
-                        p_html = (
-                            f"""
-                            <div class="parenthetical">
-                                ({clean(parenthetical)})
-                            </div>
-                            """
-                        )
-
-                    else:
-
-                        p_html = ""
-
-                    st.markdown(
-                        f"""
-                        <div class="dialogue-block">
-
-                            <div class="character-cue">
-                                {clean(
-                                    line.get(
-                                        "character"
-                                    )
-                                )}
-                            </div>
-
-                            {p_html}
-
-                            <div class="dialogue-text">
-                                {clean(
-                                    line.get(
-                                        "line"
-                                    )
-                                )}
-                            </div>
-
-                        </div>
-                        """,
-                        unsafe_allow_html=True,
-                    )
-
-                st.markdown(
-                    f"""
-                    <div class="scene-purpose">
-
-                        <b>Scene purpose:</b>
-
-                        {clean(
-                            scene.get(
-                                "purpose"
-                            )
-                        )}
-
-                    </div>
-
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-
-        # -------------------------------------------------
-        # PRODUCTION BUDGET
-        # -------------------------------------------------
-
-        st.markdown(
-            "## 💰 Production Budget"
-        )
-
-        for dept in safe_list(
-            budget.get("departments")
-        ):
-
-            if not isinstance(
-                dept,
-                dict,
-            ):
-                continue
-
-            st.markdown(
-                f"""
-                <div class="budget-row">
-
-                    <div>
-
-                        <h3>
-                            {clean(
-                                dept.get(
-                                    "department"
-                                )
-                            )}
-                        </h3>
-
-                        <p>
-                            {clean(
-                                dept.get(
-                                    "details"
-                                )
-                            )}
-                        </p>
-
-                    </div>
-
-                    <div class="budget-amount">
-
-                        <strong>
-                            {clean(
-                                dept.get(
-                                    "amount"
-                                )
-                            )}
-                        </strong>
-
-                        <span>
-                            {clean(
-                                dept.get(
-                                    "percentage"
-                                )
-                            )}%
-                        </span>
-
-                    </div>
-
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-        risks = "".join(
-            f"<li>{clean(x)}</li>"
-            for x in safe_list(
-                budget.get("risks")
-            )
-        )
-
-        card(
-            "Production Risks",
-            f"<ul>{risks}</ul>",
-            "red",
-        )
-
-        card(
-            "Final Ending",
-            (
-                f"<p>"
-                f"{clean(result.get('ending'))}"
-                f"</p>"
-            ),
-            "purple",
-        )
-
-        # -------------------------------------------------
-        # DOWNLOAD MASTER BLUEPRINT
-        # -------------------------------------------------
-
-        master_text = (
-            "============================================================\n"
-            "MASTER PRODUCTION BLUEPRINT\n"
-            "============================================================\n\n"
-            f"TITLE: "
-            f"{as_text(result.get('title'))}\n"
-            f"GENRE: {selected_genre}\n"
-            f"TONE: "
-            f"{as_text(result.get('tone'))}\n\n"
-            f"LOGLINE:\n"
-            f"{as_text(result.get('logline'))}\n\n"
-            f"THEME:\n"
-            f"{as_text(result.get('theme'))}\n\n"
-            f"WORLD / SETTING:\n"
-            f"{as_text(result.get('world'))}\n\n"
-            "============================================================\n"
-            "CHARACTERS\n"
-            "============================================================\n\n"
-        )
-
-        for i, character in enumerate(
-            characters,
-            1,
-        ):
-
-            if not isinstance(
-                character,
-                dict,
-            ):
-                continue
-
-            relationships = character.get(
-                "relationships"
-            )
-
-            if isinstance(
-                relationships,
-                list,
-            ):
-
-                relationships = ", ".join(
-                    str(x)
-                    for x in relationships
-                )
-
-            master_text += (
-                f"{i}. "
-                f"{as_text(character.get('name'))}\n"
-                f"Role: "
-                f"{as_text(character.get('role'))}\n"
-                f"Age: "
-                f"{as_text(character.get('age'))}\n"
-                f"Personality: "
-                f"{as_text(character.get('personality'))}\n"
-                f"Goal: "
-                f"{as_text(character.get('goal'))}\n"
-                f"Need: "
-                f"{as_text(character.get('need'))}\n"
-                f"Flaw: "
-                f"{as_text(character.get('flaw'))}\n"
-                f"Backstory: "
-                f"{as_text(character.get('backstory'))}\n"
-                f"Arc: "
-                f"{as_text(character.get('arc'))}\n"
-                f"Relationships: "
-                f"{as_text(relationships)}\n"
-                f"Dialogue Voice: "
-                f"{as_text(character.get('dialogue_voice'))}\n\n"
-            )
-
-        master_text += (
-            "============================================================\n"
-            "COMPLETE SCREENPLAY\n"
-            "============================================================\n"
-        )
-
-        for act in acts:
-
-            if not isinstance(
-                act,
-                dict,
-            ):
-                continue
-
-            master_text += (
-                f"\n\n"
-                f"{as_text(act.get('act'))}\n"
-                f"{as_text(act.get('purpose'))}\n\n"
-            )
-
-            for scene in safe_list(
-                act.get("scenes")
-            ):
-
-                if not isinstance(
-                    scene,
-                    dict,
-                ):
-                    continue
-
-                master_text += (
-                    f"SCENE "
-                    f"{as_text(scene.get('scene_number'))}"
-                    f" — "
-                    f"{as_text(scene.get('heading'))}\n\n"
-                    f"{as_text(scene.get('action'))}\n\n"
-                )
-
-                for line in safe_list(
-                    scene.get("dialogue")
-                ):
-
-                    if not isinstance(
-                        line,
-                        dict,
-                    ):
-                        continue
-
-                    master_text += (
-                        f"{as_text(line.get('character'))}\n"
-                    )
-
-                    parenthetical = as_text(
-                        line.get(
-                            "parenthetical"
-                        )
-                    )
-
-                    if parenthetical:
-
-                        master_text += (
-                            f"({parenthetical})\n"
-                        )
-
-                    master_text += (
-                        f"{as_text(line.get('line'))}\n\n"
-                    )
-
-                master_text += (
-                    f"Scene Purpose: "
-                    f"{as_text(scene.get('purpose'))}\n\n"
-                )
-
-        master_text += (
-            "============================================================\n"
-            "PRODUCTION BUDGET\n"
-            "============================================================\n\n"
-            f"TOTAL: "
-            f"{as_text(budget.get('total'))}\n\n"
-        )
-
-        for dept in safe_list(
-            budget.get("departments")
-        ):
-
-            if not isinstance(
-                dept,
-                dict,
-            ):
-                continue
-
-            master_text += (
-                f"{as_text(dept.get('department'))}"
-                f" — "
-                f"{as_text(dept.get('percentage'))}%"
-                f" — "
-                f"{as_text(dept.get('amount'))}\n"
-                f"{as_text(dept.get('details'))}\n\n"
-            )
-
-        master_text += (
-            "PRODUCTION RISKS\n"
-        )
-
-        for risk in safe_list(
-            budget.get("risks")
-        ):
-
-            master_text += (
-                f"- {risk}\n"
-            )
-
-        master_text += (
-            "\n============================================================\n"
-            "ENDING\n"
-            "============================================================\n\n"
-            f"{as_text(result.get('ending'))}\n"
-        )
-
-        text_download(
-            "⬇️ DOWNLOAD COMPLETE MASTER BLUEPRINT",
-            master_text,
-            "master_production_blueprint.txt",
-        )
+    st.markdown(
+        f"""
+        <div class="glass-card">
+          <div class="label violet">CREATIVE NORTH STAR</div>
+          <p class="editorial blueprint-copy">
+            {p["blueprint"] or "Synthesize the blueprint when the story has enough material. The summary becomes a living north star for the room."}
+          </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+PAGES = {
+    "Studio": render_home,
+    "Logline": render_logline,
+    "Characters": render_characters,
+    "Budget": render_budget,
+    "Screenplay": render_screenplay,
+    "Blueprint": render_blueprint,
+}
+
+
+with st.sidebar:
+    st.markdown(
+        """
+        <div class="brand">
+          <div class="brand-mark">▣</div>
+          <div>
+            <b>FRAME/01</b>
+            <small>CINEMA STUDIO</small>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        '<div class="violet-line"></div>',
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        '<div class="section-label">THE ROOM</div>',
+        unsafe_allow_html=True,
+    )
+
+    page = st.radio(
+        "Navigate",
+        list(PAGES.keys()),
+        index=list(PAGES.keys()).index(st.session_state.page),
+        label_visibility="collapsed",
+    )
+
+    if page != st.session_state.page:
+        st.session_state.page = page
+        st.rerun()
+
+    st.markdown(
+        """
+        <div class="sidebar-spacer"></div>
+
+        <div class="partner-card">
+          <div class="label violet">✦ CREATIVE PARTNER</div>
+          <p>
+            Keep the strange detail. It is usually where the film begins.
+          </p>
+        </div>
+
+        <div class="sidebar-footer">
+          <span class="avatar small">AR</span>
+          <span>
+            <b>Charu Nethra</b>
+            <small>writer / producer</small>
+          </span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+st.markdown(
+    f"""
+    <div class="topbar">
+      <span>
+        <i></i>
+        Private writer's room
+        <b>›</b>
+        {project()["title"]}
+      </span>
+      <small>
+        AUTOSAVED LOCALLY · {datetime.now().strftime("%H:%M")}
+      </small>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+PAGES[st.session_state.page]()
